@@ -1,0 +1,329 @@
+/**
+ * Antigravity 中文汉化补丁 - 版本更新自愈守护模块 (auto_heal_daemon.js)
+ *
+ * 功能说明：
+ * 1. 提供轻量级后台自愈服务安装/卸载接口（供 install_patch.js / uninstall_patch.js 调用）。
+ * 2. 采用 Windows 原生 wscript.exe 静默巡检脚本 (auto_heal.vbs) 监控 resources/app.asar 的文件指纹：
+ *    - 平时仅读取文件修改时间与大小，不持有 Antigravity.exe 进程锁，完全不影响官方安装器更新。
+ *    - 当检测到 Antigravity 官方自动更新重写了 app.asar 时，自动调用 install_patch.js --auto-heal
+ *      在 50ms 内完成新版本备份刷新与内存级重汉化。
+ * 3. 同时支持作为独立 Node 守护进程运行：
+ *    - `node auto_heal_daemon.js --once`：单次检测并按需修复
+ *    - `node auto_heal_daemon.js`：常驻监听模式
+ */
+
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const { execSync, spawn, spawnSync } = require('child_process');
+
+let ofs;
+try {
+  ofs = require('original-fs');
+} catch {
+  ofs = fs;
+}
+
+const ANTIGRAVITY_DIR = path.join(
+  process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'),
+  'Programs',
+  'antigravity'
+);
+const RESOURCES_DIR = path.join(ANTIGRAVITY_DIR, 'resources');
+const ASAR_PATH = path.join(RESOURCES_DIR, 'app.asar');
+const ANTIGRAVITY_EXE = path.join(ANTIGRAVITY_DIR, 'Antigravity.exe');
+
+const PATCH_DATA_DIR = path.join(
+  process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'),
+  'AntigravityChinesePatch'
+);
+const STATE_FILE_PATH = path.join(PATCH_DATA_DIR, 'patched_state.txt');
+const LOG_FILE_PATH = path.join(PATCH_DATA_DIR, 'auto_heal.log');
+const VBS_FILE_PATH = path.join(PATCH_DATA_DIR, 'auto_heal.vbs');
+const REG_RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
+const REG_VALUE_NAME = 'AntigravityChinesePatchAutoHeal';
+
+function appendLog(message) {
+  try {
+    if (!ofs.existsSync(PATCH_DATA_DIR)) {
+      ofs.mkdirSync(PATCH_DATA_DIR, { recursive: true });
+    }
+    const line = `[${new Date().toISOString()}] ${message}\r\n`;
+    ofs.appendFileSync(LOG_FILE_PATH, line, 'utf8');
+  } catch {
+    // 忽略日志写入异常
+  }
+}
+
+/**
+ * 直接从二进制 ASAR 归档中检查 dist/preload.js 是否包含汉化注入标记
+ */
+function isAsarPatchedRaw(asarPath) {
+  try {
+    if (!ofs.existsSync(asarPath)) return false;
+    const buf = ofs.readFileSync(asarPath);
+    if (buf.length < 16) return false;
+    const pickleSize = buf.readUInt32LE(4);
+    const stringLength = buf.readUInt32LE(12);
+    const dataOffset = 8 + pickleSize;
+    const headerEnd = 16 + stringLength;
+    if (headerEnd > buf.length || dataOffset > buf.length) return false;
+    const header = JSON.parse(buf.subarray(16, headerEnd).toString('utf8'));
+    const entry = header?.files?.dist?.files?.['preload.js'];
+    if (!entry || entry.unpacked) return false;
+    const start = dataOffset + Number(entry.offset);
+    const end = start + Number(entry.size);
+    const content = buf.subarray(start, end).toString('utf8');
+    return content.includes('Antigravity 中文汉化补丁 - 前端翻译引擎注入');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 记录当前已汉化 app.asar 的文件大小特征，供 VBS 巡检快速比对
+ */
+function recordPatchedState(asarPath = ASAR_PATH) {
+  try {
+    if (!ofs.existsSync(asarPath)) return;
+    const stat = ofs.statSync(asarPath);
+    if (!ofs.existsSync(PATCH_DATA_DIR)) {
+      ofs.mkdirSync(PATCH_DATA_DIR, { recursive: true });
+    }
+    ofs.writeFileSync(STATE_FILE_PATH, `${stat.size}`, 'utf8');
+  } catch {
+    // 忽略状态写入错误
+  }
+}
+
+/**
+ * 生成 Windows 原生静默巡检脚本 auto_heal.vbs
+ * 优势：由系统 wscript.exe 执行，不占用 Antigravity.exe 文件句柄，不影响官方自动更新安装。
+ */
+function generateAutoHealVbs() {
+  const escapedAsarPath = ASAR_PATH.replace(/"/g, '""');
+  const escapedStateFile = STATE_FILE_PATH.replace(/"/g, '""');
+  const escapedDaemonJs = path.join(PATCH_DATA_DIR, 'auto_heal_daemon.js').replace(/"/g, '""');
+  const escapedAgExe = ANTIGRAVITY_EXE.replace(/"/g, '""');
+
+  return `' Antigravity 中文汉化补丁 - 静默版本自愈巡检脚本 (auto_heal.vbs)
+Option Explicit
+On Error Resume Next
+
+Dim fso, shell, asarPath, stateFile, daemonJs, agExe
+Set fso = CreateObject("Scripting.FileSystemObject")
+Set shell = CreateObject("WScript.Shell")
+
+asarPath = "${escapedAsarPath}"
+stateFile = "${escapedStateFile}"
+daemonJs = "${escapedDaemonJs}"
+agExe = "${escapedAgExe}"
+
+Function ReadSavedSize()
+  ReadSavedSize = ""
+  If fso.FileExists(stateFile) Then
+    Dim ts
+    Set ts = fso.OpenTextFile(stateFile, 1, False)
+    If Not ts.AtEndOfStream Then
+      ReadSavedSize = Trim(ts.ReadAll())
+    End If
+    ts.Close
+  End If
+End Function
+
+Sub TriggerHeal()
+  Dim cmd
+  ' 优先使用系统 node.exe（若存在），否则使用 Antigravity.exe 的 ELECTRON_RUN_AS_NODE 模式瞬时执行（耗时 < 100ms）
+  shell.Environment("Process")("ELECTRON_RUN_AS_NODE") = "1"
+  If fso.FileExists(agExe) Then
+    cmd = """" & agExe & """ """ & daemonJs & """ --once"
+    shell.Run cmd, 0, True
+  End If
+End Sub
+
+' 启动时先做一次快速校验
+If fso.FileExists(asarPath) Then
+  Dim initFile, initSize, savedSize
+  Set initFile = fso.GetFile(asarPath)
+  initSize = CStr(initFile.Size)
+  savedSize = ReadSavedSize()
+  If savedSize <> initSize Then
+    WScript.Sleep 2000
+    TriggerHeal()
+  End If
+End If
+
+' 每 12 秒静默检查一次 app.asar 文件大小是否发生变化（官方更新后会变成未打补丁大小）
+Do
+  WScript.Sleep 12000
+  Err.Clear
+  If fso.FileExists(asarPath) Then
+    Dim f, currentSize, expectedSize
+    Set f = fso.GetFile(asarPath)
+    If Err.Number = 0 Then
+      currentSize = CStr(f.Size)
+      expectedSize = ReadSavedSize()
+      If expectedSize <> "" And currentSize <> expectedSize Then
+        ' 等待官方更新程序完成文件写入
+        WScript.Sleep 3000
+        TriggerHeal()
+      End If
+    End If
+  End If
+Loop
+`;
+}
+
+/**
+ * 终止已有的 auto_heal.vbs 后台进程（避免重复运行）
+ */
+function stopRunningAutoHealDaemon() {
+  if (process.platform !== 'win32') return;
+  try {
+    const psCmd = `Get-CimInstance Win32_Process -Filter "Name='wscript.exe' OR Name='cscript.exe'" | Where-Object { $_.CommandLine -like '*AntigravityChinesePatch*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`;
+    spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', psCmd], {
+      stdio: 'ignore',
+      windowsHide: true,
+      timeout: 5000,
+    });
+  } catch {
+    // 忽略清理异常
+  }
+}
+
+/**
+ * 部署自愈守护文件并注册开机与实时后台监听
+ */
+function installAutoHealService(sourceDir = __dirname) {
+  if (process.platform !== 'win32') return false;
+
+  try {
+    if (!ofs.existsSync(PATCH_DATA_DIR)) {
+      ofs.mkdirSync(PATCH_DATA_DIR, { recursive: true });
+    }
+
+    const filesToCopy = [
+      'install_patch.js',
+      'translations.js',
+      'i18n_inject.js',
+      'auto_heal_daemon.js',
+    ];
+
+    for (const file of filesToCopy) {
+      const src = path.join(sourceDir, file);
+      const dst = path.join(PATCH_DATA_DIR, file);
+      if (ofs.existsSync(src) && path.resolve(src) !== path.resolve(dst)) {
+        ofs.copyFileSync(src, dst);
+      }
+    }
+
+    recordPatchedState(ASAR_PATH);
+    ofs.writeFileSync(VBS_FILE_PATH, generateAutoHealVbs(), 'utf8');
+
+    // 注册当前用户开机自启（无需管理员权限）
+    const regCmd = `reg add "${REG_RUN_KEY}" /v "${REG_VALUE_NAME}" /t REG_SZ /d "wscript.exe //B \\"${VBS_FILE_PATH}\\"" /f`;
+    execSync(regCmd, { stdio: 'ignore', windowsHide: true });
+
+    // 启动后台静默守护进程（异步脱钩，不阻塞安装脚本）
+    stopRunningAutoHealDaemon();
+    const child = spawn('wscript.exe', ['//B', VBS_FILE_PATH], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    child.unref();
+
+    appendLog('已成功安装/刷新版本更新自愈守护服务。');
+    return true;
+  } catch (err) {
+    appendLog(`安装自愈服务失败: ${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * 卸载自愈守护服务、清理注册表项与持久化目录
+ */
+function uninstallAutoHealService() {
+  if (process.platform !== 'win32') return;
+  try {
+    stopRunningAutoHealDaemon();
+  } catch {}
+
+  try {
+    const regDelCmd = `reg delete "${REG_RUN_KEY}" /v "${REG_VALUE_NAME}" /f`;
+    execSync(regDelCmd, { stdio: 'ignore', windowsHide: true });
+  } catch {}
+
+  try {
+    if (ofs.existsSync(PATCH_DATA_DIR)) {
+      ofs.rmSync(PATCH_DATA_DIR, { recursive: true, force: true });
+    }
+  } catch {}
+}
+
+/**
+ * 执行单次检测并在发现 app.asar 未汉化时自动调用 install_patch.js 修复
+ */
+function checkAndHealOnce() {
+  if (!ofs.existsSync(ASAR_PATH)) {
+    return false;
+  }
+  if (isAsarPatchedRaw(ASAR_PATH)) {
+    recordPatchedState(ASAR_PATH);
+    return false;
+  }
+
+  appendLog('检测到 resources/app.asar 被更新为英文原版，正在自动重新应用中文汉化补丁...');
+  const installScript = path.join(__dirname, 'install_patch.js');
+  if (!ofs.existsSync(installScript)) {
+    appendLog(`未找到安装脚本: ${installScript}`);
+    return false;
+  }
+
+  const res = spawnSync(process.execPath, [installScript, '--auto-heal'], {
+    env: {
+      ...process.env,
+      ELECTRON_RUN_AS_NODE: '1',
+      ANTIGRAVITY_PATCH_NO_PAUSE: '1',
+    },
+    windowsHide: true,
+    encoding: 'utf8',
+    timeout: 30000,
+  });
+
+  if (res.status === 0) {
+    recordPatchedState(ASAR_PATH);
+    appendLog('自动重汉化成功！');
+    return true;
+  } else {
+    appendLog(`自动重汉化失败 (退出码 ${res.status}): ${res.stderr || res.stdout || ''}`);
+    return false;
+  }
+}
+
+if (require.main === module) {
+  if (process.argv.includes('--once')) {
+    checkAndHealOnce();
+    process.exit(0);
+  } else {
+    appendLog('Node 常驻自愈监听模式已启动');
+    checkAndHealOnce();
+    setInterval(() => {
+      try {
+        checkAndHealOnce();
+      } catch {}
+    }, 10000);
+  }
+}
+
+module.exports = {
+  PATCH_DATA_DIR,
+  STATE_FILE_PATH,
+  VBS_FILE_PATH,
+  isAsarPatchedRaw,
+  recordPatchedState,
+  installAutoHealService,
+  uninstallAutoHealService,
+  checkAndHealOnce,
+};

@@ -1,0 +1,13 @@
+# 调试与历史原始 ASAR 快照
+*.asar
+*.asar.backup
+*.asar.old
+
+# 本地构建发布包目录（通过 GitHub Releases 发布）
+release/
+
+# Node 与系统临时文件
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
