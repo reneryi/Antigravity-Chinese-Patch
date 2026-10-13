@@ -38,6 +38,7 @@ const PATCH_DATA_DIR = path.join(
   'AntigravityChinesePatch'
 );
 const STATE_FILE_PATH = path.join(PATCH_DATA_DIR, 'patched_state.txt');
+const SOURCE_DIR_FILE = path.join(PATCH_DATA_DIR, 'source_dir.txt');
 const LOG_FILE_PATH = path.join(PATCH_DATA_DIR, 'auto_heal.log');
 const VBS_FILE_PATH = path.join(PATCH_DATA_DIR, 'auto_heal.vbs');
 const REG_RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
@@ -97,8 +98,42 @@ function recordPatchedState(asarPath = ASAR_PATH) {
 }
 
 /**
+ * 从原始工作区目录同步最新的词库与补丁脚本（若存在）
+ */
+function syncFromSourceDirIfAvailable() {
+  try {
+    if (!ofs.existsSync(SOURCE_DIR_FILE)) return;
+    const sourceDir = ofs.readFileSync(SOURCE_DIR_FILE, 'utf8').trim();
+    if (!sourceDir || !ofs.existsSync(sourceDir)) return;
+
+    const filesToSync = [
+      'install_patch.js',
+      'translations.js',
+      'i18n_inject.js',
+      'auto_heal_daemon.js',
+    ];
+    for (const file of filesToSync) {
+      const src = path.join(sourceDir, file);
+      const dst = path.join(PATCH_DATA_DIR, file);
+      if (ofs.existsSync(src) && path.resolve(src) !== path.resolve(dst)) {
+        const srcStat = ofs.statSync(src);
+        const dstStat = ofs.existsSync(dst) ? ofs.statSync(dst) : null;
+        if (!dstStat || srcStat.mtimeMs > dstStat.mtimeMs || srcStat.size !== dstStat.size) {
+          ofs.copyFileSync(src, dst);
+        }
+      }
+    }
+  } catch {
+    // 忽略同步异常
+  }
+}
+
+/**
  * 生成 Windows 原生静默巡检脚本 auto_heal.vbs
- * 优势：由系统 wscript.exe 执行，不占用 Antigravity.exe 文件句柄，不影响官方自动更新安装。
+ * 优势：
+ * 1. 纯 ASCII 编码，100% 免疫 Windows GBK/UTF-8 代码页差异。
+ * 2. 由系统 wscript.exe 执行，不占用 Antigravity.exe 文件句柄，不影响官方安装包覆盖更新。
+ * 3. 1.5 秒高频轻量级元数据检测 + 文件写入稳定度检测，在官方安装器解压完 app.asar 后、启动客户端前瞬时完成自愈。
  */
 function generateAutoHealVbs() {
   const escapedAsarPath = ASAR_PATH.replace(/"/g, '""');
@@ -106,11 +141,13 @@ function generateAutoHealVbs() {
   const escapedDaemonJs = path.join(PATCH_DATA_DIR, 'auto_heal_daemon.js').replace(/"/g, '""');
   const escapedAgExe = ANTIGRAVITY_EXE.replace(/"/g, '""');
 
-  return `' Antigravity 中文汉化补丁 - 静默版本自愈巡检脚本 (auto_heal.vbs)
+  return `' Antigravity Chinese Patch - Silent Auto-Heal Daemon (auto_heal.vbs)
 Option Explicit
 On Error Resume Next
 
 Dim fso, shell, asarPath, stateFile, daemonJs, agExe
+Dim expectedSize, currentSize, lastFailedSize, failCount
+
 Set fso = CreateObject("Scripting.FileSystemObject")
 Set shell = CreateObject("WScript.Shell")
 
@@ -118,55 +155,95 @@ asarPath = "${escapedAsarPath}"
 stateFile = "${escapedStateFile}"
 daemonJs = "${escapedDaemonJs}"
 agExe = "${escapedAgExe}"
+lastFailedSize = ""
+failCount = 0
 
 Function ReadSavedSize()
+  Err.Clear
   ReadSavedSize = ""
   If fso.FileExists(stateFile) Then
     Dim ts
     Set ts = fso.OpenTextFile(stateFile, 1, False)
-    If Not ts.AtEndOfStream Then
-      ReadSavedSize = Trim(ts.ReadAll())
+    If Err.Number = 0 Then
+      If Not ts.AtEndOfStream Then
+        ReadSavedSize = Trim(ts.ReadAll())
+      End If
+      ts.Close
     End If
-    ts.Close
   End If
 End Function
 
+Function GetAsarSize()
+  Err.Clear
+  GetAsarSize = ""
+  If fso.FileExists(asarPath) Then
+    Dim f
+    Set f = fso.GetFile(asarPath)
+    If Err.Number = 0 Then
+      GetAsarSize = CStr(f.Size)
+    End If
+  End If
+End Function
+
+Sub WaitForStableAsar()
+  Dim prevSize, nowSize, i
+  prevSize = GetAsarSize()
+  For i = 1 To 12
+    WScript.Sleep 500
+    nowSize = GetAsarSize()
+    If nowSize <> "" And nowSize = prevSize And CLng(nowSize) > 1000000 Then
+      Exit Sub
+    End If
+    prevSize = nowSize
+  Next
+End Sub
+
 Sub TriggerHeal()
+  Err.Clear
   Dim cmd
-  ' 优先使用系统 node.exe（若存在），否则使用 Antigravity.exe 的 ELECTRON_RUN_AS_NODE 模式瞬时执行（耗时 < 100ms）
   shell.Environment("Process")("ELECTRON_RUN_AS_NODE") = "1"
   If fso.FileExists(agExe) Then
     cmd = """" & agExe & """ """ & daemonJs & """ --once"
     shell.Run cmd, 0, True
+  Else
+    cmd = "node.exe """ & daemonJs & """ --once"
+    shell.Run cmd, 0, True
   End If
 End Sub
 
-' 启动时先做一次快速校验
-If fso.FileExists(asarPath) Then
-  Dim initFile, initSize, savedSize
-  Set initFile = fso.GetFile(asarPath)
-  initSize = CStr(initFile.Size)
-  savedSize = ReadSavedSize()
-  If savedSize <> initSize Then
-    WScript.Sleep 2000
-    TriggerHeal()
-  End If
+expectedSize = ReadSavedSize()
+currentSize = GetAsarSize()
+If currentSize <> "" And currentSize <> expectedSize Then
+  Call WaitForStableAsar()
+  Call TriggerHeal()
+  expectedSize = ReadSavedSize()
 End If
 
-' 每 12 秒静默检查一次 app.asar 文件大小是否发生变化（官方更新后会变成未打补丁大小）
 Do
-  WScript.Sleep 12000
+  WScript.Sleep 1500
   Err.Clear
-  If fso.FileExists(asarPath) Then
-    Dim f, currentSize, expectedSize
-    Set f = fso.GetFile(asarPath)
-    If Err.Number = 0 Then
-      currentSize = CStr(f.Size)
-      expectedSize = ReadSavedSize()
-      If expectedSize <> "" And currentSize <> expectedSize Then
-        ' 等待官方更新程序完成文件写入
-        WScript.Sleep 3000
-        TriggerHeal()
+  currentSize = GetAsarSize()
+  If currentSize <> "" And currentSize <> expectedSize Then
+    expectedSize = ReadSavedSize()
+    If currentSize <> expectedSize Then
+      If currentSize = lastFailedSize And failCount >= 10 Then
+        WScript.Sleep 15000
+      Else
+        Call WaitForStableAsar()
+        Call TriggerHeal()
+        expectedSize = ReadSavedSize()
+        currentSize = GetAsarSize()
+        If currentSize <> expectedSize Then
+          If lastFailedSize = currentSize Then
+            failCount = failCount + 1
+          Else
+            lastFailedSize = currentSize
+            failCount = 1
+          End If
+        Else
+          lastFailedSize = ""
+          failCount = 0
+        End If
       End If
     End If
   End If
@@ -202,6 +279,10 @@ function installAutoHealService(sourceDir = __dirname) {
       ofs.mkdirSync(PATCH_DATA_DIR, { recursive: true });
     }
 
+    if (sourceDir && path.resolve(sourceDir) !== path.resolve(PATCH_DATA_DIR)) {
+      ofs.writeFileSync(SOURCE_DIR_FILE, path.resolve(sourceDir), 'utf8');
+    }
+
     const filesToCopy = [
       'install_patch.js',
       'translations.js',
@@ -218,20 +299,30 @@ function installAutoHealService(sourceDir = __dirname) {
     }
 
     recordPatchedState(ASAR_PATH);
-    ofs.writeFileSync(VBS_FILE_PATH, generateAutoHealVbs(), 'utf8');
+    ofs.writeFileSync(VBS_FILE_PATH, generateAutoHealVbs(), 'ascii');
 
     // 注册当前用户开机自启（无需管理员权限）
     const regCmd = `reg add "${REG_RUN_KEY}" /v "${REG_VALUE_NAME}" /t REG_SZ /d "wscript.exe //B \\"${VBS_FILE_PATH}\\"" /f`;
     execSync(regCmd, { stdio: 'ignore', windowsHide: true });
 
-    // 启动后台静默守护进程（异步脱钩，不阻塞安装脚本）
-    stopRunningAutoHealDaemon();
-    const child = spawn('wscript.exe', ['//B', VBS_FILE_PATH], {
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: true,
-    });
-    child.unref();
+    // 启动后台静默守护进程（通过 WMI Win32_Process.Create 脱离当前终端 Job Object，防止终端关闭时连带终止守护进程）
+    try {
+      const escapedVbs = VBS_FILE_PATH.replace(/'/g, "''");
+      const psCmd = `Get-CimInstance Win32_Process -Filter "Name='wscript.exe' OR Name='cscript.exe'" | Where-Object { $_.CommandLine -like '*AntigravityChinesePatch*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; $vbs = '${escapedVbs}'; $res = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = "wscript.exe //B \`"$vbs\`"" }; if (-not $res -or $res.ReturnValue -ne 0) { Start-Process -FilePath 'wscript.exe' -ArgumentList '//B', $vbs -WindowStyle Hidden }`;
+      spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', psCmd], {
+        stdio: 'ignore',
+        windowsHide: true,
+        timeout: 8000,
+      });
+    } catch {
+      stopRunningAutoHealDaemon();
+      const child = spawn('wscript.exe', ['//B', VBS_FILE_PATH], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+      child.unref();
+    }
 
     appendLog('已成功安装/刷新版本更新自愈守护服务。');
     return true;
@@ -274,6 +365,7 @@ function checkAndHealOnce() {
     return false;
   }
 
+  syncFromSourceDirIfAvailable();
   appendLog('检测到 resources/app.asar 被更新为英文原版，正在自动重新应用中文汉化补丁...');
   const installScript = path.join(__dirname, 'install_patch.js');
   if (!ofs.existsSync(installScript)) {

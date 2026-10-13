@@ -334,19 +334,28 @@ async function main() {
 
   const unpackedFiles = collectUnpackedFiles(sourceParsed.header);
   if (unpackedFiles.size > 0 && !ofs.existsSync(ASAR_UNPACKED_PATH)) {
-    console.error(`错误：原始包引用了 ${unpackedFiles.size} 个外置文件，但未找到目录：`);
-    console.error(ASAR_UNPACKED_PATH);
-    process.exit(1);
-  }
-  const missingUnpackedFiles = [...unpackedFiles.keys()].filter(
-    (relativePath) => !ofs.existsSync(path.join(ASAR_UNPACKED_PATH, relativePath))
-  );
-  if (missingUnpackedFiles.length > 0) {
-    console.error(`错误：缺少 ${missingUnpackedFiles.length} 个 ASAR 外置文件，例如：`);
-    for (const relativePath of missingUnpackedFiles.slice(0, 5)) {
-      console.error(`  ${relativePath}`);
+    if (AUTO_HEAL_MODE) {
+      console.warn(`警告：安装程序可能仍在解压外置目录 (${ASAR_UNPACKED_PATH})，将继续保留 unpacked 索引。`);
+    } else {
+      console.error(`错误：原始包引用了 ${unpackedFiles.size} 个外置文件，但未找到目录：`);
+      console.error(ASAR_UNPACKED_PATH);
+      process.exit(1);
     }
-    process.exit(1);
+  } else if (unpackedFiles.size > 0) {
+    const missingUnpackedFiles = [...unpackedFiles.keys()].filter(
+      (relativePath) => !ofs.existsSync(path.join(ASAR_UNPACKED_PATH, relativePath))
+    );
+    if (missingUnpackedFiles.length > 0) {
+      if (AUTO_HEAL_MODE) {
+        console.warn(`警告：安装程序可能仍在解压外置文件（暂缺 ${missingUnpackedFiles.length} 个），将继续保留其 unpacked 索引。`);
+      } else {
+        console.error(`错误：缺少 ${missingUnpackedFiles.length} 个 ASAR 外置文件，例如：`);
+        for (const relativePath of missingUnpackedFiles.slice(0, 5)) {
+          console.error(`  ${relativePath}`);
+        }
+        process.exit(1);
+      }
+    }
   }
   console.log(`检测到 ${unpackedFiles.size} 个 ASAR 外置文件，将完整保留其 unpacked 索引。`);
 

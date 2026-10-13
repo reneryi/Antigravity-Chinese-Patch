@@ -141,6 +141,33 @@ const samples = [
     'Read, create, edit, and manage Google Docs. Use when the user shares a docs.google.com URL, asks to summarize or extract content from a doc, wants a doc drafted, edited, formatted, or commented on, wants tables, images, or smart chips inserted, wants markdown imported or synchronized with a doc, or wants a doc exported. Requires a known document ID — use the gdrive skill to search for or locate documents. Don\'t use for Google Sheets, Slides, or Drive file management.',
     '读取、创建、编辑和管理 Google 文档 (Google Docs)。当用户分享 docs.google.com 链接、要求总结或提取文档内容、起草/编辑/格式化/评论文档、插入表格/图片/智能芯片、导入或同步 Markdown，或导出文档时使用。需要已知的文档 ID——可使用 gdrive 技能搜索或定位文档。请勿用于 Google 表格、幻灯片或云端硬盘文件管理。',
   ],
+  // === Antigravity 2.23.0 插件市场、MCP 服务目录、MCP 配置项与内置工具测试 ===
+  [
+    'Connect to Google Workspace, including Docs, Sheets, Slides, Drive, and Calendar.',
+    '连接 Google Workspace，包括文档 (Docs)、表格 (Sheets)、幻灯片 (Slides)、云端硬盘 (Drive) 和日历 (Calendar)。',
+  ],
+  [
+    "Build on Google's developer platforms, including Android, Chrome, Gemini, and Google Cloud.",
+    '基于 Google 开发者平台进行构建，涵盖 Android、Chrome、Gemini 和 Google Cloud。',
+  ],
+  [
+    'The Cloud Audit Manager remote MCP server allows you to enroll projects, generate audit and scope reports, and check resource enrollment statuses in the us-central1 region.',
+    'Cloud Audit Manager 远程 MCP 服务允许您在 us-central1 区域注册项目、生成审计与范围报告，并检查资源注册状态。',
+  ],
+  [
+    'Manage your Neon backend with the Neon MCP Server: Lakebase Postgres, branching, Object Storage, Functions, and the AI Gateway',
+    '使用 Neon MCP 服务管理您的 Neon 后端：涵盖 Lakebase Postgres、数据库分支、对象存储、云函数以及 AI 网关。',
+  ],
+  [
+    'Interact with your Vercel projects using natural language. Vercel MCP allows AI tools to search Vercel documentation, inspect projects and deployments, analyze deployment and build logs, and manage supported Vercel resources securely.',
+    '使用自然语言与您的 Vercel 项目交互。Vercel MCP 允许 AI 工具搜索 Vercel 文档、检查项目和部署状态、分析部署与构建日志，并安全地管理受支持的 Vercel 资源。',
+  ],
+  ['Looker Base URL', 'Looker 基础 URL'],
+  ['Neo4j Connection URI', 'Neo4j 连接 URI'],
+  ['Clicks on the provided element', '点击指定的页面元素。'],
+  ['by Google', '由 Google 提供'],
+  ['Error restarting MCP server: connection timeout', '重启 MCP 服务出错：connection timeout'],
+  ['Search for "bigquery" in the Marketplace', '在插件市场中搜索“bigquery”'],
 ];
 
 const nodes = samples.map(([source]) => {
@@ -166,6 +193,21 @@ const attributeSample = body.append(new FakeElement('BUTTON', {
   'aria-label': 'Description: Mcp Tools: 153 tokens',
   title: 'Conversation Name',
 }));
+
+// 测试 <input> 与 <textarea> 的 placeholder / aria-label 属性翻译（同时保护内部文本不被误改）
+const inputCustomizations = body.append(new FakeElement('INPUT', {
+  placeholder: 'Search customizations...',
+  'aria-label': 'Search customizations...',
+}));
+const inputMcpSearch = body.append(new FakeElement('INPUT', {
+  placeholder: 'Search MCP servers by name',
+  'aria-label': 'Search MCP servers by name',
+}));
+const textareaSample = body.append(new FakeElement('TEXTAREA', {
+  placeholder: 'Paste code',
+}));
+const textareaInnerText = textareaSample.append(new FakeText('Settings'));
+
 const globalPermissionsSummary = body.append(new FakeElement('DIV'));
 globalPermissionsSummary.append(new FakeText('Controls the actions the agent can take.'));
 globalPermissionsSummary.append(new FakeText('Modified in '));
@@ -196,6 +238,12 @@ assert.strictEqual(
   attributeSample.getAttribute('aria-label'),
   '说明：MCP 工具：153 个令牌',
 );
+assert.strictEqual(inputCustomizations.getAttribute('placeholder'), '搜索自定义扩展...');
+assert.strictEqual(inputCustomizations.getAttribute('aria-label'), '搜索自定义扩展...');
+assert.strictEqual(inputMcpSearch.getAttribute('placeholder'), '按名称搜索 MCP 服务器');
+assert.strictEqual(inputMcpSearch.getAttribute('aria-label'), '按名称搜索 MCP 服务器');
+assert.strictEqual(textareaSample.getAttribute('placeholder'), '粘贴代码');
+assert.strictEqual(textareaInnerText.nodeValue, 'Settings', 'Textarea inner text content must not be translated');
 assert.strictEqual(globalPermissionsSummary.textContent, '控制智能体可以执行的操作。已在 4 个项目中修改');
 
 // 验证受保护区域未被误翻
@@ -221,5 +269,5 @@ assert.strictEqual(hasUpdateBlocker, false, 'updater.js should not block officia
 assert.strictEqual(typeof isAsarPatchedRaw, 'function');
 
 console.log(
-  `i18n runtime & architecture tests passed: ${samples.length + 10} assertions (dictionary size: ${Object.keys(i18nModule.EXACT_TRANSLATIONS).length} exact entries)`
+  `i18n runtime & architecture tests passed: ${samples.length + 16} assertions (dictionary size: ${Object.keys(i18nModule.EXACT_TRANSLATIONS).length} exact entries)`
 );

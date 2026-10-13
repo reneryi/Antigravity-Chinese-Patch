@@ -49,17 +49,16 @@ function parseYamlDesc(content) {
       if (inDesc) break;
       if (km[1] === 'description') {
         const val = km[2].trim();
-        if (val === '>' || val === '>-' || val === '|' || val === '|-') {
-          inDesc = true;
-        } else {
-          return val.replace(/^['"]|['"]$/g, '');
+        inDesc = true;
+        if (val !== '>' && val !== '>-' && val !== '|' && val !== '|-') {
+          buf.push(val.replace(/^['"]|['"]$/g, ''));
         }
       }
     } else if (inDesc) {
       buf.push(line.trim());
     }
   }
-  if (inDesc && buf.length) return buf.filter(Boolean).join(' ');
+  if (inDesc && buf.length) return buf.filter(Boolean).join(' ').replace(/^['"]|['"]$/g, '');
   return null;
 }
 
@@ -67,10 +66,20 @@ function scanLocalSkillsAndPlugins() {
   const home = os.homedir();
   const dirs = [
     path.join(home, '.gemini', 'antigravity', 'builtin'),
+    path.join(home, '.gemini', 'antigravity', 'cache'),
+    path.join(home, '.gemini', 'antigravity', 'mcp'),
     path.join(home, '.gemini', 'config', 'plugins'),
   ];
   let total = 0;
   const uncovered = [];
+
+  function checkDesc(desc) {
+    if (!desc || typeof desc !== 'string') return;
+    const norm = desc.replace(/\s+/g, ' ').trim();
+    if (!norm || norm.length < 3 || !/[A-Za-z]{2,}/.test(norm)) return;
+    total++;
+    if (!isTranslated(norm)) uncovered.push(norm);
+  }
 
   function walk(dir) {
     if (!fs.existsSync(dir)) return;
@@ -80,18 +89,19 @@ function scanLocalSkillsAndPlugins() {
         if (entry.name !== 'node_modules' && entry.name !== '.git') walk(full);
       } else if (entry.name.endsWith('.md')) {
         const desc = parseYamlDesc(fs.readFileSync(full, 'utf8'));
-        if (desc) {
-          total++;
-          const norm = desc.replace(/\s+/g, ' ').trim();
-          if (!isTranslated(norm)) uncovered.push(norm);
-        }
-      } else if (entry.name === 'plugin.json') {
+        if (desc) checkDesc(desc);
+      } else if (entry.name.endsWith('.json')) {
         try {
           const pj = JSON.parse(fs.readFileSync(full, 'utf8'));
-          if (pj.description) {
-            total++;
-            const norm = pj.description.replace(/\s+/g, ' ').trim();
-            if (!isTranslated(norm)) uncovered.push(norm);
+          if (entry.name === 'plugin.json' || entry.name === 'marketplace.json') {
+            if (pj.description) checkDesc(pj.description);
+            if (Array.isArray(pj.plugins)) {
+              for (const p of pj.plugins) {
+                if (p && p.description) checkDesc(p.description);
+              }
+            }
+          } else if (full.includes(path.join('.gemini', 'antigravity', 'mcp'))) {
+            if (pj.description) checkDesc(pj.description);
           }
         } catch {}
       }
@@ -107,9 +117,9 @@ function fetchActiveMainJs() {
       const logPath = path.join(process.env.APPDATA || '', 'Antigravity', 'logs', 'language_server.log');
       if (!fs.existsSync(logPath)) return resolve(null);
       const log = fs.readFileSync(logPath, 'utf8');
-      const m = log.match(/listening on random port at (\d+) for HTTPS/i);
-      if (!m) return resolve(null);
-      const port = m[1];
+      const matches = [...log.matchAll(/listening on random port at (\d+) for HTTPS/gi)];
+      if (!matches.length) return resolve(null);
+      const port = matches[matches.length - 1][1];
       https.get(`https://127.0.0.1:${port}/main.js`, { rejectUnauthorized: false }, (res) => {
         if (res.statusCode !== 200) return resolve(null);
         const chunks = [];
