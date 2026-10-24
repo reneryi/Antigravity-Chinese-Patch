@@ -1,5 +1,5 @@
 /**
- * Antigravity 中文汉化补丁 - 卸载脚本 (v3.0)
+ * Antigravity 中文汉化补丁 - 卸载脚本 (v3.6)
  *
  * 功能说明：
  * 1. 停止并移除后台版本自愈守护服务及开机自启注册表项。
@@ -60,7 +60,7 @@ function readAsarMeta(asarPath) {
 }
 
 console.log('='.repeat(64));
-console.log('  Antigravity 中文汉化补丁 v3.0 卸载程序');
+console.log('  Antigravity 中文汉化补丁 v3.6 卸载程序');
 console.log('='.repeat(64));
 console.log('');
 

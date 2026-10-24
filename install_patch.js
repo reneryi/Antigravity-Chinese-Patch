@@ -1,15 +1,15 @@
 /**
- * Antigravity 中文汉化补丁 - 内存级极速安装与自愈脚本 (v3.0)
+ * Antigravity 中文汉化补丁 - 内存级极速安装与自愈脚本 (v3.6)
  *
  * 核心特性：
  * 1. 纯内存 ASAR 解析与重打包引擎：直接读取二进制流并原地替换 dist/*.js，
  *    无需将 700+ 个文件解压到 %TEMP%，彻底消除 Windows 临时目录 EPERM 锁死报错，耗时 < 100ms。
  * 2. 双层全量汉化注入：
- *    - 主进程层：源码级静态替换 + Electron Menu/Dialog/Tray 动态 API 钩子
+ *    - 主进程层：源码级静态替换 + Electron Menu/Dialog/Tray 动态 API 钩子 + 自动更新同步事务代理拦截钩子
  *    - 渲染进程层：preload.js 前端引擎注入 + 原生右键菜单/通知 IPC 拦截 + utils.js 主世界兜底注入
- * 3. 官方自动更新兼容与自愈：
- *    - 完整保留 Antigravity 官方自动更新能力
- *    - 自动注册轻量级 wscript 后台版本自愈巡检服务，官方更新覆盖 app.asar 后自动无缝重汉化
+ * 3. 官方自动更新同步事务接管 (update_runner.vbs) 与 NTFS 目录联接 (mklink /J) 自愈：
+ *    - 完整保留 Antigravity 官方软件内自动更新能力，通过 `/S` 静默阻塞代理彻底阻断更新后首次偷跑英文原版
+ *    - 自动识别并守护跨盘 NTFS 目录联接（如 E:\AntigravityData\Programs\antigravity），官方更新后确定性恢复联接并重汉化
  */
 
 const fs = require('fs');
@@ -17,7 +17,12 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const translations = require('./translations.js');
-const { installAutoHealService, recordPatchedState } = require('./auto_heal_daemon.js');
+const {
+  installAutoHealService,
+  recordPatchedState,
+  ensureDirectoryJunction,
+  isAutoHealDaemonRunning,
+} = require('./auto_heal_daemon.js');
 
 let ofs;
 try {
@@ -44,6 +49,8 @@ const TEMP_DIR_PREFIX = 'antigravity-zh-';
 const DRY_RUN = process.argv.includes('--dry-run');
 const AUTO_HEAL_MODE = process.argv.includes('--auto-heal');
 const NO_DAEMON = process.argv.includes('--no-daemon');
+const JUNCTION_ARG = process.argv.find((a) => a.startsWith('--junction-target='));
+const EXPLICIT_JUNCTION_TARGET = JUNCTION_ARG ? JUNCTION_ARG.slice('--junction-target='.length).trim() : null;
 
 const ASAR_BLOCK_SIZE = 4 * 1024 * 1024; // 4MB
 
@@ -270,15 +277,28 @@ async function main() {
   console.log('='.repeat(64));
   console.log(
     DRY_RUN
-      ? '  Antigravity 中文汉化补丁 v3.0 验证程序（纯内存模式，不修改安装文件）'
+      ? '  Antigravity 中文汉化补丁 v3.6 验证程序（纯内存模式，不修改安装文件）'
       : AUTO_HEAL_MODE
-        ? '  Antigravity 中文汉化补丁 v3.0 自动自愈重装程序'
-        : '  Antigravity 中文汉化补丁 v3.0 极速安装程序'
+        ? '  Antigravity 中文汉化补丁 v3.6 自动自愈重装程序'
+        : '  Antigravity 中文汉化补丁 v3.6 极速安装程序'
   );
   console.log('='.repeat(64));
   console.log('');
 
   cleanupStaleTempDirs();
+
+  if (!DRY_RUN) {
+    const juncRes = ensureDirectoryJunction(EXPLICIT_JUNCTION_TARGET);
+    if (juncRes.status === 'already_junction') {
+      console.log(`✓ NTFS 目录联接正常: ${ANTIGRAVITY_DIR} -> ${juncRes.target}`);
+    } else if (juncRes.status === 'repaired') {
+      console.log(`✓ 已自动恢复 NTFS 目录联接: ${ANTIGRAVITY_DIR} -> ${juncRes.target}`);
+    } else if (juncRes.status === 'deferred_to_daemon') {
+      console.log(
+        `ℹ 已记录跨盘目录联接目标: ${juncRes.target}\n  （当前 Antigravity 正在运行，将在软件关闭或更新重启时由后台守护进程自动迁移回目标盘并重建 mklink /J）`
+      );
+    }
+  }
 
   if (!ofs.existsSync(ASAR_PATH)) {
     console.error('错误：未找到 Antigravity 安装文件。');
@@ -637,16 +657,19 @@ ${ipcHookSnippet}
   }
 
   // ==========================================================================
-  // 部署版本更新自愈守护服务
+  // 部署版本更新自愈与 NTFS 目录联接守护服务
   // ==========================================================================
   if (!DRY_RUN) {
     if (AUTO_HEAL_MODE) {
       recordPatchedState(ASAR_PATH);
     } else if (!NO_DAEMON) {
       console.log('');
-      console.log('正在配置版本更新自动自愈守护服务...');
+      console.log('正在配置版本更新与跨盘目录联接自动自愈守护服务...');
       if (installAutoHealService(__dirname)) {
-        console.log('  ✓ 已启用后台版本更新自愈守护（官方更新后将自动无缝重汉化）');
+        const daemonAlive = isAutoHealDaemonRunning();
+        console.log(
+          `  ✓ 已启用同步更新代理 (update_runner.vbs) 与 mklink /J 守护服务 (进程存活验证: ${daemonAlive ? '运行中' : '已注册开机自启'})`
+        );
       } else {
         console.log('  ⚠ 自愈守护注册未完成，核心汉化补丁仍已正常生效');
       }
@@ -659,7 +682,7 @@ ${ipcHookSnippet}
   console.log(
     DRY_RUN
       ? `  ✓ 验证完成（耗时 ${elapsedMs}ms），安装文件未被修改。`
-      : `  ✓ 汉化补丁 v3.0 安装成功！（耗时 ${elapsedMs}ms）`
+      : `  ✓ 汉化补丁 v3.6 安装成功！（耗时 ${elapsedMs}ms）`
   );
   if (!DRY_RUN && !AUTO_HEAL_MODE) {
     console.log('  请重新启动 Antigravity 以查看完整中文界面效果。');

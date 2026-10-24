@@ -114,12 +114,23 @@ function scanLocalSkillsAndPlugins() {
 function fetchActiveMainJs() {
   return new Promise((resolve) => {
     try {
-      const logPath = path.join(process.env.APPDATA || '', 'Antigravity', 'logs', 'language_server.log');
-      if (!fs.existsSync(logPath)) return resolve(null);
-      const log = fs.readFileSync(logPath, 'utf8');
-      const matches = [...log.matchAll(/listening on random port at (\d+) for HTTPS/gi)];
-      if (!matches.length) return resolve(null);
-      const port = matches[matches.length - 1][1];
+      const logsDir = path.join(process.env.APPDATA || '', 'Antigravity', 'logs');
+      let port = null;
+      const mainLogPath = path.join(logsDir, 'main.log');
+      if (fs.existsSync(mainLogPath)) {
+        const mLog = fs.readFileSync(mainLogPath, 'utf8');
+        const mMatches = [...mLog.matchAll(/Local:\s*https:\/\/127\.0\.0\.1:(\d+)/gi)];
+        if (mMatches.length) port = mMatches[mMatches.length - 1][1];
+      }
+      if (!port) {
+        const lsLogPath = path.join(logsDir, 'language_server.log');
+        if (fs.existsSync(lsLogPath)) {
+          const lsLog = fs.readFileSync(lsLogPath, 'utf8');
+          const lsMatches = [...lsLog.matchAll(/listening on random port at (\d+) for HTTPS/gi)];
+          if (lsMatches.length) port = lsMatches[lsMatches.length - 1][1];
+        }
+      }
+      if (!port) return resolve(null);
       https.get(`https://127.0.0.1:${port}/main.js`, { rejectUnauthorized: false }, (res) => {
         if (res.statusCode !== 200) return resolve(null);
         const chunks = [];

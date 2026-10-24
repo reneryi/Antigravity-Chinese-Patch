@@ -1,12 +1,13 @@
 /**
- * Antigravity 中文汉化补丁 - 核心翻译映射表与主进程动态拦截器 (v3.0)
+ * Antigravity 中文汉化补丁 - 核心翻译映射表与主进程动态拦截器 (v3.6)
  *
  * 本文件包含：
- * 1. Electron 主进程各模块 (dist/*.js) 的静态源码级翻译映射表（适配 Antigravity 2.22.0+）
+ * 1. Electron 主进程各模块 (dist/*.js) 的静态源码级翻译映射表（适配 Antigravity 2.26.0+）
  * 2. Electron 主进程运行时动态 API 钩子 (MAIN_PROCESS_I18N_HOOK)，自动拦截并汉化：
  *    - Menu.buildFromTemplate / MenuItem（应用菜单、系统托盘菜单、原生右键菜单）
  *    - dialog.showMessageBox / showErrorBox / showOpenDialog / showSaveDialog（原生系统对话框）
- * 3. 保留官方自动更新完整链路（不再閹割 checkForUpdates），配合守护进程实现更新后自动重汉化。
+ * 3. 软件内自动更新拦截转交：拦截 `--updated` 并将控制权移交给同步更新事务代理 `update_runner.vbs`，
+ *    配合后台守护进程实现自动更新与跨盘 mklink /J 联接 100% 确定性自愈。
  */
 
 // ============================================================================
@@ -14,7 +15,7 @@
 // ============================================================================
 
 const MAIN_PROCESS_I18N_HOOK = `
-// === Antigravity 中文汉化补丁 v3.0 - 主进程原生 API 动态汉化钩子 ===
+// === Antigravity 中文汉化补丁 v3.6 - 主进程原生 API 动态汉化钩子 ===
 (function() {
   try {
     const _electron = require('electron');
@@ -247,6 +248,71 @@ const MAIN_PROCESS_I18N_HOOK = `
           return maybeOpts ? _origOpenDlg(winOrOpts, maybeOpts) : _origOpenDlg(winOrOpts);
         };
       }
+    }
+
+    // 拦截软件内自动更新安装器启动 (electron-updater NsisUpdater):
+    // 当检测到 --updated 时，不再让主进程直接以非静默模式放跑 NSIS 安装器（非静默模式下 NSIS 无视
+    // --force-run 被剥离，仍会通过 IfSilent 0 +3 无条件偷跑英文原版 Antigravity.exe 并锁死 C 盘），
+    // 而是将更新任务交由独立的同步串行事务代理 update_runner.vbs 接管执行：
+    // Step 1: 等待旧版 Antigravity.exe 进程完全退出释放句柄
+    // Step 2: 阻塞运行 Antigravity-x64.exe --updated /S（静默安装，绝不自启英文原版）
+    // Step 3: 自动恢复被 NSIS 重置的跨盘 NTFS 目录联接 (mklink /J -> E 盘)
+    // Step 4: 内存级极速完成新版 app.asar 备份刷新与中文补丁注入
+    // Step 5: 若更新前带有重启预期，自动拉起全中文的新版 Antigravity.exe --updated
+    const _cp = require('child_process');
+    if (_cp && typeof _cp.spawn === 'function' && !_cp.__agySpawnHooked) {
+      _cp.__agySpawnHooked = true;
+      const _origSpawn = _cp.spawn;
+      _cp.spawn = function(cmd, args, options) {
+        try {
+          if (Array.isArray(args) && args.includes('--updated')) {
+            const _fs = require('fs');
+            const _path = require('path');
+            const patchDir = _path.join(process.env.APPDATA || '', 'AntigravityChinesePatch');
+            const runnerPath = _path.join(patchDir, 'update_runner.vbs');
+            const isElevate = typeof cmd === 'string' && /elevate\\.exe$/i.test(cmd);
+            const installerExe = isElevate ? String(args[0] || '') : String(cmd || '');
+            const rawArgs = isElevate ? args.slice(1) : args;
+
+            if (installerExe && _fs.existsSync(runnerPath)) {
+              // 在 NSIS oneClick 模式下：带 --force-run 或未带 /S 均代表安装后应启动客户端；
+              // 仅带 /S 且不带 --force-run（如退出时静默更新 autoInstallOnAppQuit）代表安装后不启动。
+              const shouldRelaunch = rawArgs.includes('--force-run') || !rawArgs.includes('/S');
+              const extraArgs = rawArgs
+                .filter((a) => a !== '--updated' && a !== '--force-run' && a !== '/S' && !String(a).startsWith('/D='))
+                .map((a) => (String(a).includes(' ') && !String(a).startsWith('"') ? '"' + String(a) + '"' : String(a)))
+                .join(' ');
+
+              const taskContent = [installerExe, shouldRelaunch ? '1' : '0', extraArgs].join('\\r\\n');
+              _fs.writeFileSync(_path.join(patchDir, 'update_task.txt'), taskContent, 'utf8');
+              _fs.writeFileSync(_path.join(patchDir, 'active_installer.txt'), installerExe, 'utf8');
+              if (shouldRelaunch) {
+                _fs.writeFileSync(_path.join(patchDir, 'relaunch_requested.flag'), installerExe, 'utf8');
+              }
+              const sizeFile = _path.join(patchDir, 'patched_state.txt');
+              if (_fs.existsSync(sizeFile)) {
+                try { _fs.unlinkSync(sizeFile); } catch {}
+              }
+
+              const spawnOpts = Object.assign(
+                {},
+                options && typeof options === 'object' ? options : {},
+                {
+                  cwd: patchDir,
+                  detached: true,
+                  stdio: 'ignore',
+                  windowsHide: true,
+                }
+              );
+              return _origSpawn.call(this, 'wscript.exe', ['//B', runnerPath], spawnOpts);
+            }
+          }
+        } catch (hookErr) {
+          console.error('[Antigravity 汉化补丁] 更新器拦截异常，回退默认更新流程:', hookErr);
+        }
+
+        return _origSpawn.call(this, cmd, args, options);
+      };
     }
   } catch (e) {
     console.error('[Antigravity 汉化补丁] 主进程钩子初始化异常:', e);

@@ -1,6 +1,13 @@
 const assert = require('assert');
 const translations = require('./translations.js');
-const { isAsarPatchedRaw } = require('./auto_heal_daemon.js');
+const {
+  isAsarPatchedRaw,
+  isFileLocked,
+  isDirectoryJunction,
+  detectAndSaveJunctionTarget,
+  generateAutoHealVbs,
+  generateUpdateRunnerVbs,
+} = require('./auto_heal_daemon.js');
 
 class FakeText {
   constructor(value) {
@@ -168,6 +175,52 @@ const samples = [
   ['by Google', '由 Google 提供'],
   ['Error restarting MCP server: connection timeout', '重启 MCP 服务出错：connection timeout'],
   ['Search for "bigquery" in the Marketplace', '在插件市场中搜索“bigquery”'],
+  // === Antigravity 2.24 / 2.25 斜杠命令 (/compact, /plan, MCP Prompt)、语音模式与遥测权限测试 ===
+  ['Compact the conversation to reduce context usage.', '压缩对话内容以减少上下文占用。'],
+  ['Compact the conversation now (summarize history to free up the context window).', '立即压缩当前对话（总结历史记录以释放上下文窗口空间）。'],
+  ['Generate a detailed step-by-step plan before executing.', '在执行前生成详细的分步实施计划。'],
+  ['Plan carefully before executing a task.', '在执行任务前进行周密规划。'],
+  [
+    'Prompt the user to interactively perform a user journey in the app, then generate a test from the recorded actions.',
+    '提示用户在应用中交互式地执行一段用户操作流程，然后根据录制的操作自动生成测试代码。',
+  ],
+  [
+    'Prompts the LLM to attempt to accomplish a user journey in the running app using flutter driver. If successful, it will then translate the steps it followed into a flutter driver test and write that to disk.',
+    '提示大语言模型使用 Flutter Driver 在正在运行的应用中尝试完成一段用户旅程。如果成功，它会将所执行的步骤转换为 Flutter Driver 测试并写入磁盘。',
+  ],
+  ['Auto-compact', '自动压缩上下文'],
+  ['Automatically compact conversations when approaching context limit', '当接近上下文容量上限时自动压缩对话'],
+  ['Per-Conversation Telemetry', '单次会话遥测选项'],
+  ['Show an option on each conversation to disable telemetry.', '在每个会话中显示用于禁用遥测的选项。'],
+  ['Use Voice Mode', '使用语音模式'],
+  ['Configure Customizations', '配置自定义项'],
+  ['Open Your First Workspace', '打开您的第一个工作区'],
+  ['Grant the agent maximal freedom to build without interruptions.', '授予智能体最高自由度，无中断地自主完成构建。'],
+  ['Failed to update rule: disk full', '更新规则失败：disk full'],
+  ['Toggle diff mode (unified/split)', '切换差异对比模式 (统一/并排)'],
+  ['Add to Chat (Ctrl+L)', '添加到对话 (Ctrl+L)'],
+  ['Message queued. 2 messages in queue.', '消息已加入队列（当前队列中有 2 条消息）。'],
+  ['Yes, and always allow in this project', '是，并在此项目中始终允许'],
+  ['Yes, save rule in this conversation', '是，在此对话中保存规则'],
+  ['Yes, save rule globally', '是，保存为全局规则'],
+  ['Conflicts with your configured Ask permission: Bash', '与您配置的“询问”权限冲突：Bash'],
+  // === Antigravity 2.26.0 远程控制 (Remote Control)、已连接应用 (Connected apps) 与云端工作区资源测试 ===
+  ['Get started with Remote Control', '开始使用远程控制'],
+  ['Remote Control Instances', '远程控制实例'],
+  ['Connected apps', '已连接的应用'],
+  ['Apps connected to your account', '已连接到您账户的应用'],
+  ['Files and resources in cloud workspaces', '云端工作区中的文件与资源'],
+  [
+    'Sign in to an app once and your agent can use it on any device. Open an app to see the account it uses or to disconnect it.',
+    '只需登录一次应用，您的智能体即可在任何设备上使用它。打开应用即可查看其关联账户或断开连接。',
+  ],
+  [
+    'Enter the configuration values this MCP server needs. Saving restarts the server with them.',
+    '输入此 MCP 服务器所需的配置值。保存后将使用新配置重启该服务器。',
+  ],
+  ['Built-in Browser Requires Isolated Web App (IWA)', '内置浏览器需要独立 Web 应用 (IWA)'],
+  ['Fork in New Workspace', '在新工作区中分叉 (Fork)'],
+  ['Search tabs, files, extensions, subagents, artifacts, tasks...', '搜索标签页、文件、扩展、子智能体、产物、任务...'],
 ];
 
 const nodes = samples.map(([source]) => {
@@ -260,14 +313,52 @@ assert.strictEqual(monacoProtected.text._agyOriginal, undefined);
 assert.strictEqual(typeof globalThis.__agyTranslateString, 'function');
 assert.strictEqual(globalThis.__agyTranslateString('Copy Relative Path'), '复制相对路径');
 
-// 验证主进程 translations.js 已恢复官方自动更新且包含动态 API 钩子
+// 验证主进程 translations.js 已恢复官方自动更新且包含动态 API 钩子与同步更新事务代理钩子
 assert.ok(translations.MAIN_PROCESS_I18N_HOOK.includes('__agyMainHookInstalled'));
+assert.ok(translations.MAIN_PROCESS_I18N_HOOK.includes('__agySpawnHooked'));
+assert.ok(translations.MAIN_PROCESS_I18N_HOOK.includes('update_runner.vbs'));
+assert.ok(translations.MAIN_PROCESS_I18N_HOOK.includes('update_task.txt'));
+// 编译校验注入主进程的钩子源码语法 100% 合法（防止模板字符串转义错误注入 dist/main.js）
+assert.doesNotThrow(() => new Function(translations.MAIN_PROCESS_I18N_HOOK), 'MAIN_PROCESS_I18N_HOOK must be valid JS syntax');
 const hasUpdateBlocker = (translations['updater.js'] || []).some(
   (entry) => entry.translated && entry.translated.includes('拦截并截断自动检查逻辑')
 );
 assert.strictEqual(hasUpdateBlocker, false, 'updater.js should not block official checkForUpdates');
 assert.strictEqual(typeof isAsarPatchedRaw, 'function');
+assert.strictEqual(typeof isFileLocked, 'function');
+assert.strictEqual(typeof isDirectoryJunction, 'function');
+assert.strictEqual(typeof detectAndSaveJunctionTarget, 'function');
+
+// 验证生成的 auto_heal.vbs 与 update_runner.vbs 100% 纯 ASCII、包含 /S 静默更新与环境变量清理、且所有 Sub/Function 显式声明过程级 On Error Resume Next
+function verifyVbsProcedureErrorScopes(vbsContent, scriptName) {
+  assert.ok(/^[\x00-\x7F]+$/.test(vbsContent), `${scriptName} must be 100% pure ASCII`);
+  assert.ok(vbsContent.includes('Remove "ELECTRON_RUN_AS_NODE"'), `${scriptName} must clean up ELECTRON_RUN_AS_NODE`);
+  const procRegex = /^(Sub|Function)\s+([A-Za-z0-9_]+)\([^)]*\)([\s\S]*?)^End\s+\1/gm;
+  let match;
+  let count = 0;
+  while ((match = procRegex.exec(vbsContent)) !== null) {
+    count++;
+    const procName = match[2];
+    const bodyLines = match[3]
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith("'"));
+    assert.strictEqual(
+      bodyLines[0],
+      'On Error Resume Next',
+      `${scriptName} procedure ${procName} MUST start with On Error Resume Next`
+    );
+  }
+  assert.ok(count >= 9, `${scriptName} should contain at least 9 Sub/Function definitions (found ${count})`);
+}
+
+const autoHealVbsContent = generateAutoHealVbs();
+const updateRunnerVbsContent = generateUpdateRunnerVbs();
+verifyVbsProcedureErrorScopes(autoHealVbsContent, 'auto_heal.vbs');
+verifyVbsProcedureErrorScopes(updateRunnerVbsContent, 'update_runner.vbs');
+assert.ok(updateRunnerVbsContent.includes('--updated /S'), 'update_runner.vbs must execute NSIS installer with --updated /S');
+assert.ok(autoHealVbsContent.includes('runner.lock'), 'auto_heal.vbs must coordinate with runner.lock');
 
 console.log(
-  `i18n runtime & architecture tests passed: ${samples.length + 16} assertions (dictionary size: ${Object.keys(i18nModule.EXACT_TRANSLATIONS).length} exact entries)`
+  `i18n runtime & architecture tests passed: ${samples.length + 31} assertions (dictionary size: ${Object.keys(i18nModule.EXACT_TRANSLATIONS).length} exact entries, ${i18nModule.REGEX_TRANSLATIONS.length} dynamic regexes)`
 );
